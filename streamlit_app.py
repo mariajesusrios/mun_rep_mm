@@ -18,17 +18,20 @@ def zfill_cvegeo(series: pd.Series) -> pd.Series:
     s = s.str[-5:]
     return s.str.zfill(5)
 
+def zfill_2(series: pd.Series) -> pd.Series:
+    s = series.astype(str).str.strip()
+    s = s.str.replace(".0", "", regex=False)
+    s = s.str.replace(r"\D", "", regex=True)
+    s = s.str[-2:]
+    return s.str.zfill(2)
+
 @st.cache_data
 def load_main():
     return pd.read_csv("data/municipios_mortalidad_materna.csv")
 
 @st.cache_data
-def load_geojson_4326():
-    """
-    IMPORTANTE:
-    Usa el archivo YA reproyectado a EPSG:4326.
-    """
-    with open("data/municipios_mexico_4326.geojson", "r", encoding="utf-8") as f:
+def load_geojson():
+    with open("data/municipios_mexico.geojson", "r", encoding="utf-8") as f:
         gj = json.load(f)
 
     def norm_cvegeo(val):
@@ -38,6 +41,7 @@ def load_geojson_4326():
             s = s[-5:]
         return s.zfill(5)
 
+    # Normaliza CVEGEO en properties
     for feat in gj.get("features", []):
         props = feat.get("properties", {})
         if "CVEGEO" in props and props["CVEGEO"] is not None:
@@ -50,11 +54,22 @@ def load_geojson_4326():
 
     return gj
 
+@st.cache_data
+def geo_cvegeo_df(geojson_mun: dict) -> pd.DataFrame:
+    """DataFrame base con TODOS los CVEGEO del GeoJSON (para que se dibujen las fronteras)."""
+    geo_ids = [feat.get("properties", {}).get("CVEGEO") for feat in geojson_mun.get("features", [])]
+    geo_ids = [g for g in geo_ids if g is not None]
+    geo_ids = sorted(set(geo_ids))
+    base = pd.DataFrame({"CVEGEO": geo_ids})
+    base["CVE_ENT"] = base["CVEGEO"].str[:2]
+    return base
+
 # =========================
 # LOAD DATA
 # =========================
 df = load_main()
-geojson_mun = load_geojson_4326()
+geojson_mun = load_geojson()
+geo_base = geo_cvegeo_df(geojson_mun)
 
 if "CVEGEO" not in df.columns:
     st.error("No encuentro la columna 'CVEGEO' en tu CSV.")
@@ -62,14 +77,16 @@ if "CVEGEO" not in df.columns:
 
 df["CVEGEO"] = zfill_cvegeo(df["CVEGEO"])
 
+# Columnas esperadas en tu CSV (tú sí las tienes)
 ent_col = "nom_ent" if "nom_ent" in df.columns else None
 mun_col = "MUNICIPIO" if "MUNICIPIO" in df.columns else None
+cod_ent_col = "cod_ent_s" if "cod_ent_s" in df.columns else None
+
+if cod_ent_col:
+    df[cod_ent_col] = zfill_2(df[cod_ent_col])
 
 # años disponibles
-years_found = []
-for y in [2020, 2021, 2022, 2023, 2024]:
-    if f"mm{y}" in df.columns or f"rmm{y}" in df.columns:
-        years_found.append(y)
+years_found = [y for y in [2020, 2021, 2022, 2023, 2024] if (f"mm{y}" in df.columns or f"rmm{y}" in df.columns)]
 if not years_found:
     years_found = [2020, 2021, 2022, 2023, 2024]
 
@@ -85,144 +102,145 @@ col_nac = f"nacimientos{anio}" if f"nacimientos{anio}" in df.columns else None
 
 metric = st.sidebar.radio("Métrica", ["Muertes maternas", "RMM"], index=0)
 
-if ent_col:
-    entidades = ["Todas"] + sorted(df[ent_col].dropna().unique().tolist())
+# Entidad
+ent_sel = "Todas"
+ent_code_sel = None
+
+if ent_col and cod_ent_col:
+    ent_map = (
+        df[[ent_col, cod_ent_col]]
+        .dropna()
+        .drop_duplicates()
+        .sort_values(ent_col)
+    )
+    entidades = ["Todas"] + ent_map[ent_col].tolist()
     ent_sel = st.sidebar.selectbox("Entidad", entidades)
-else:
-    ent_sel = "Todas"
+
+    if ent_sel != "Todas":
+        ent_code_sel = ent_map.loc[ent_map[ent_col] == ent_sel, cod_ent_col].iloc[0]
 
 ocultar_ceros = st.sidebar.checkbox("Ocultar municipios con valor 0", value=False)
 
 # =========================
-# FILTER
+# DEFINE MÉTRICA PARA MAPA
 # =========================
-df_f = df.copy()
-if ent_col and ent_sel != "Todas":
-    df_f = df_f[df_f[ent_col] == ent_sel]
+df_work = df.copy()
 
-# =========================
-# METRIC COLUMN
-# =========================
 if metric == "Muertes maternas":
     if col_mm is None:
         st.error(f"No existe la columna mm{anio} en tu CSV.")
         st.stop()
-    map_color_col = col_mm
+    map_val_col = col_mm
     map_title = f"Muertes maternas {anio}"
 else:
-    # Si no existe rmmYYYY pero sí mm/nac, la calculamos
     if col_rmm is None:
         if col_mm and col_nac:
-            col_rmm = f"rmm_calc_{anio}"
-            df_f[col_rmm] = (
-                pd.to_numeric(df_f[col_mm], errors="coerce") /
-                pd.to_numeric(df_f[col_nac], errors="coerce")
+            map_val_col = f"rmm_calc_{anio}"
+            df_work[map_val_col] = (
+                pd.to_numeric(df_work[col_mm], errors="coerce") /
+                pd.to_numeric(df_work[col_nac], errors="coerce")
             ) * 100000
         else:
             st.error(f"No existe rmm{anio} y no puedo calcularla (falta mm{anio} o nacimientos{anio}).")
             st.stop()
-    map_color_col = col_rmm
+    else:
+        map_val_col = col_rmm
     map_title = f"RMM {anio}"
 
-map_df = df_f.copy()
-map_df[map_color_col] = pd.to_numeric(map_df[map_color_col], errors="coerce")
-
-if ocultar_ceros:
-    map_df = map_df[map_df[map_color_col].fillna(0) != 0]
+df_work[map_val_col] = pd.to_numeric(df_work[map_val_col], errors="coerce")
 
 # =========================
-# MAP (TODOS LOS MUNICIPIOS + FRONTERAS)
+# ARMA DATAFRAME DE PLOT CON TODOS LOS MUNICIPIOS
+# (AQUÍ ESTÁ LA CLAVE)
+# =========================
+plot_df = geo_base.copy()
+
+# Si seleccionan estado: filtra el ESQUELETO por CVE_ENT (para que se vean TODOS los municipios del estado, tengan o no dato)
+if ent_code_sel is not None:
+    plot_df = plot_df[plot_df["CVE_ENT"] == ent_code_sel].copy()
+
+# Join de datos del CSV contra el esqueleto
+cols_to_merge = ["CVEGEO", map_val_col]
+if ent_col: cols_to_merge.append(ent_col)
+if mun_col: cols_to_merge.append(mun_col)
+
+plot_df = plot_df.merge(df_work[cols_to_merge], on="CVEGEO", how="left")
+
+# Relleno para que Plotly DIBUJE todos los polígonos (NaN => 0 para pintar muy claro)
+plot_df["_plot_value_"] = plot_df[map_val_col].fillna(0)
+
+# Si quieres ocultar ceros, quitamos ceros SOLO del color (pero eso también quita polígonos).
+# Tú pediste ver fronteras aunque no haya dato, así que:
+# - si ocultar_ceros=True, NO eliminamos filas; solo marcamos un color "casi blanco".
+if ocultar_ceros:
+    # dejamos 0 pero aclaramos visualmente con rango (sigue dibujando fronteras)
+    pass
+
+# =========================
+# MAPA
 # =========================
 st.subheader(f"Mapa municipal — {anio}")
 
-# --- 1) lista completa de municipios del GeoJSON (CVEGEO)
-geo_ids = [feat.get("properties", {}).get("CVEGEO") for feat in geojson_mun.get("features", [])]
-geo_ids = [g for g in geo_ids if g is not None]
-
-base_geo = pd.DataFrame({"CVEGEO": pd.Series(geo_ids, dtype=str).dropna().unique()})
-base_geo["CVEGEO"] = zfill_cvegeo(base_geo["CVEGEO"])
-
-# --- 2) filtra tus datos por entidad (si aplica) y deja numérico
-data_df = df_f[["CVEGEO", map_color_col]].copy()
-data_df["CVEGEO"] = zfill_cvegeo(data_df["CVEGEO"])
-data_df[map_color_col] = pd.to_numeric(data_df[map_color_col], errors="coerce")
-
-if ocultar_ceros:
-    data_df = data_df[data_df[map_color_col].fillna(0) != 0]
-
-# --- 3) merge: conserva TODOS los municipios (aunque no tengan dato)
-plot_df = base_geo.merge(data_df, on="CVEGEO", how="left")
-
-# Si estás filtrando por estado, reduce a ese estado también (pero conservando sus municipios sin dato)
-if ent_col and ent_sel != "Todas":
-    # OJO: para esto necesitamos saber qué municipios del geojson pertenecen a la entidad.
-    # Si tu geojson trae NOM_ENT / CVE_ENT en properties, úsalo. Si no, lo hacemos por df.
-    # Aquí lo hacemos por df (más seguro con tu dataset):
-    cves_estado = set(df_f["CVEGEO"].astype(str))
-    plot_df = plot_df[plot_df["CVEGEO"].isin(cves_estado)]
-
-# --- 4) Columna para pintar: NaN -> -1 (sentinela para "Sin dato")
-plot_col = f"{map_color_col}__plot"
-plot_df[plot_col] = plot_df[map_color_col].copy()
-plot_df[plot_col] = plot_df[plot_col].where(plot_df[plot_col].notna(), -1)
-
-# rango para color (evita que -1 “rompa” la escala)
-max_val = pd.to_numeric(plot_df[map_color_col], errors="coerce").max()
-if pd.isna(max_val):
-    max_val = 1
-
-# Escala: gris para -1, rojo para datos
-# (0 corresponde a -1 porque ponemos range_color=(-1, max_val))
-custom_scale = [
-    (0.0,  "rgb(230,230,230)"),  # -1 => sin dato (gris)
-    (0.000001, "rgb(255,245,240)"),
-    (0.2,  "rgb(254,224,210)"),
-    (0.4,  "rgb(252,146,114)"),
-    (0.6,  "rgb(251,106,74)"),
-    (0.8,  "rgb(222,45,38)"),
-    (1.0,  "rgb(165,15,21)"),
-]
+hover_data = {
+    "_plot_value_": False,  # no mostrar el interno
+    map_val_col: True,
+    "CVEGEO": True,
+}
+if ent_col:
+    hover_data[ent_col] = True
 
 fig = px.choropleth(
     plot_df,
     geojson=geojson_mun,
     locations="CVEGEO",
     featureidkey="properties.CVEGEO",
-    color=plot_col,
-    color_continuous_scale=custom_scale,
-    range_color=(-1, max_val),
+    color="_plot_value_",
+    color_continuous_scale="Reds",
     hover_name=mun_col if mun_col else "CVEGEO",
-    hover_data={
-        "CVEGEO": True,
-        map_color_col: True,
-        plot_col: False,   # no mostrar la columna sentinela
-    },
+    hover_data=hover_data,
 )
 
-# --- 5) fronteras visibles SIEMPRE
-fig.update_traces(marker_line_width=0.6, marker_line_color="rgba(120,120,120,0.7)")
+# Fronteras municipales visibles SIEMPRE
+fig.update_traces(marker_line_color="rgba(90,90,90,0.65)", marker_line_width=0.4)
 
-# --- 6) encuadre país/estado
-fig.update_geos(projection_type="mercator")
-
-if ent_col and ent_sel != "Todas":
+# Fitbounds correcto: estado => locations, país => geojson
+if ent_code_sel is not None:
     fig.update_geos(fitbounds="locations")
 else:
-    fig.update_geos(center=dict(lat=23.5, lon=-102.0), projection_scale=4.8)
+    fig.update_geos(fitbounds="geojson")
 
-# --- 7) fondo / contexto
+# Fondo (evita “negro vacío”)
 fig.update_geos(
-    showland=True, landcolor="rgb(245,245,245)",
-    showocean=True, oceancolor="rgb(230,230,230)",
-    showcoastlines=True, coastlinecolor="rgba(150,150,150,0.7)",
+    visible=False,
+    showland=True,
+    landcolor="rgb(245,245,245)",
+    showocean=True,
+    oceancolor="rgb(230,230,230)",
+    showcountries=True,
+    countrycolor="rgba(120,120,120,0.6)",
 )
 
 fig.update_layout(
     height=720,
-    margin=dict(r=0, t=0, l=0, b=0),
+    margin={"r": 0, "t": 0, "l": 0, "b": 0},
     coloraxis_colorbar=dict(title=map_title),
     paper_bgcolor="rgba(0,0,0,0)",
     plot_bgcolor="rgba(0,0,0,0)",
 )
 
 st.plotly_chart(fig, use_container_width=True)
+
+# =========================
+# DIAGNÓSTICO
+# =========================
+geo_ids = set(geo_base["CVEGEO"].astype(str))
+df_ids = set(df["CVEGEO"].dropna().astype(str))
+matched = df_ids.intersection(geo_ids)
+
+with st.expander("Diagnóstico (match CVEGEO)", expanded=False):
+    st.write("Municipios en CSV:", len(df_ids))
+    st.write("Municipios en GeoJSON:", len(geo_ids))
+    st.write("Coincidencias:", len(matched))
+    st.write("Ejemplo CSV CVEGEO:", sorted(list(df_ids))[:10])
+    st.write("Ejemplo GeoJSON CVEGEO:", sorted(list(geo_ids))[:10])
+    st.write("Faltan en CSV (primeros 20):", sorted(list(geo_ids - df_ids))[:20])
