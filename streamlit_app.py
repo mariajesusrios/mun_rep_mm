@@ -131,77 +131,98 @@ if ocultar_ceros:
     map_df = map_df[map_df[map_color_col].fillna(0) != 0]
 
 # =========================
-# MAP
+# MAP (TODOS LOS MUNICIPIOS + FRONTERAS)
 # =========================
 st.subheader(f"Mapa municipal — {anio}")
 
-n_valid = map_df[map_color_col].notna().sum()
-if n_valid == 0:
-    st.warning(f"No hay valores numéricos en {map_color_col} para la selección actual.")
-    st.stop()
+# --- 1) lista completa de municipios del GeoJSON (CVEGEO)
+geo_ids = [feat.get("properties", {}).get("CVEGEO") for feat in geojson_mun.get("features", [])]
+geo_ids = [g for g in geo_ids if g is not None]
 
-hover_data = {map_color_col: True, "CVEGEO": True}
-if ent_col:
-    hover_data[ent_col] = True
+base_geo = pd.DataFrame({"CVEGEO": pd.Series(geo_ids, dtype=str).dropna().unique()})
+base_geo["CVEGEO"] = zfill_cvegeo(base_geo["CVEGEO"])
+
+# --- 2) filtra tus datos por entidad (si aplica) y deja numérico
+data_df = df_f[["CVEGEO", map_color_col]].copy()
+data_df["CVEGEO"] = zfill_cvegeo(data_df["CVEGEO"])
+data_df[map_color_col] = pd.to_numeric(data_df[map_color_col], errors="coerce")
+
+if ocultar_ceros:
+    data_df = data_df[data_df[map_color_col].fillna(0) != 0]
+
+# --- 3) merge: conserva TODOS los municipios (aunque no tengan dato)
+plot_df = base_geo.merge(data_df, on="CVEGEO", how="left")
+
+# Si estás filtrando por estado, reduce a ese estado también (pero conservando sus municipios sin dato)
+if ent_col and ent_sel != "Todas":
+    # OJO: para esto necesitamos saber qué municipios del geojson pertenecen a la entidad.
+    # Si tu geojson trae NOM_ENT / CVE_ENT en properties, úsalo. Si no, lo hacemos por df.
+    # Aquí lo hacemos por df (más seguro con tu dataset):
+    cves_estado = set(df_f["CVEGEO"].astype(str))
+    plot_df = plot_df[plot_df["CVEGEO"].isin(cves_estado)]
+
+# --- 4) Columna para pintar: NaN -> -1 (sentinela para "Sin dato")
+plot_col = f"{map_color_col}__plot"
+plot_df[plot_col] = plot_df[map_color_col].copy()
+plot_df[plot_col] = plot_df[plot_col].where(plot_df[plot_col].notna(), -1)
+
+# rango para color (evita que -1 “rompa” la escala)
+max_val = pd.to_numeric(plot_df[map_color_col], errors="coerce").max()
+if pd.isna(max_val):
+    max_val = 1
+
+# Escala: gris para -1, rojo para datos
+# (0 corresponde a -1 porque ponemos range_color=(-1, max_val))
+custom_scale = [
+    (0.0,  "rgb(230,230,230)"),  # -1 => sin dato (gris)
+    (0.000001, "rgb(255,245,240)"),
+    (0.2,  "rgb(254,224,210)"),
+    (0.4,  "rgb(252,146,114)"),
+    (0.6,  "rgb(251,106,74)"),
+    (0.8,  "rgb(222,45,38)"),
+    (1.0,  "rgb(165,15,21)"),
+]
 
 fig = px.choropleth(
-    map_df,
+    plot_df,
     geojson=geojson_mun,
     locations="CVEGEO",
     featureidkey="properties.CVEGEO",
-    color=map_color_col,
-    color_continuous_scale="Reds",
+    color=plot_col,
+    color_continuous_scale=custom_scale,
+    range_color=(-1, max_val),
     hover_name=mun_col if mun_col else "CVEGEO",
-    hover_data=hover_data,
+    hover_data={
+        "CVEGEO": True,
+        map_color_col: True,
+        plot_col: False,   # no mostrar la columna sentinela
+    },
 )
 
-# ✅ AJUSTE FINO (CRÍTICO)
-# - Si es país completo: fitbounds=geojson + center + projection_scale
-# - Si es estado: fitbounds=locations
+# --- 5) fronteras visibles SIEMPRE
+fig.update_traces(marker_line_width=0.6, marker_line_color="rgba(120,120,120,0.7)")
+
+# --- 6) encuadre país/estado
+fig.update_geos(projection_type="mercator")
+
 if ent_col and ent_sel != "Todas":
     fig.update_geos(fitbounds="locations")
 else:
-    fig.update_geos(
-        fitbounds="geojson",
-        center=dict(lat=23.5, lon=-102.0),   # centro aproximado de México
-        projection_scale=4.5                 # zoom inicial (ajustable 4.0–5.2)
-    )
+    fig.update_geos(center=dict(lat=23.5, lon=-102.0), projection_scale=4.8)
 
-# ✅ CONTEXTO (NO FONDO NEGRO)
-# IMPORTANTE: usar visible=True para que se pinte el fondo (land/ocean)
+# --- 7) fondo / contexto
 fig.update_geos(
-    visible=True,
-    showcountries=False,
-    showcoastlines=True,
-    coastlinecolor="rgba(140,140,140,0.7)",
-    showland=True,
-    landcolor="rgb(245,245,245)",
-    showocean=True,
-    oceancolor="rgb(230,230,230)",
-    bgcolor="rgba(0,0,0,0)",  # transparente
+    showland=True, landcolor="rgb(245,245,245)",
+    showocean=True, oceancolor="rgb(230,230,230)",
+    showcoastlines=True, coastlinecolor="rgba(150,150,150,0.7)",
 )
 
 fig.update_layout(
     height=720,
-    margin={"r": 0, "t": 0, "l": 0, "b": 0},
+    margin=dict(r=0, t=0, l=0, b=0),
     coloraxis_colorbar=dict(title=map_title),
     paper_bgcolor="rgba(0,0,0,0)",
     plot_bgcolor="rgba(0,0,0,0)",
 )
 
 st.plotly_chart(fig, use_container_width=True)
-
-# =========================
-# DIAGNÓSTICO
-# =========================
-geo_ids = {feat.get("properties", {}).get("CVEGEO") for feat in geojson_mun.get("features", [])}
-geo_ids.discard(None)
-df_ids = set(df_f["CVEGEO"].dropna().astype(str))
-matched = df_ids.intersection(geo_ids)
-
-with st.expander("Diagnóstico (match CVEGEO)", expanded=False):
-    st.write("Municipios en selección (df):", len(df_ids))
-    st.write("Municipios en GeoJSON:", len(geo_ids))
-    st.write("Coincidencias (match):", len(matched))
-    st.write("Ejemplo df CVEGEO:", sorted(list(df_ids))[:10])
-    st.write("Ejemplo geojson CVEGEO:", sorted(list(geo_ids))[:10])
