@@ -155,28 +155,38 @@ fig = px.choropleth(
     hover_data=hover_data,
 )
 
-# ✅ CLAVE PARA QUE SE VEA EL PAÍS COMPLETO:
-# Fit a TODO el geojson (no a "locations" filtradas) cuando es "Todas"
+# ✅ AJUSTE FINO (CRÍTICO)
+# - Si es país completo: fitbounds=geojson + center + projection_scale
+# - Si es estado: fitbounds=locations
 if ent_col and ent_sel != "Todas":
     fig.update_geos(fitbounds="locations")
 else:
-    fig.update_geos(fitbounds="geojson")
+    fig.update_geos(
+        fitbounds="geojson",
+        center=dict(lat=23.5, lon=-102.0),   # centro aproximado de México
+        projection_scale=4.5                 # zoom inicial (ajustable 4.0–5.2)
+    )
 
-# Muestra “contexto” (tierra y costa) para que NO se vea “negro”
+# ✅ CONTEXTO (NO FONDO NEGRO)
+# IMPORTANTE: usar visible=True para que se pinte el fondo (land/ocean)
 fig.update_geos(
-    visible=False,
-    showcountries=True,
-    countrycolor="rgba(120,120,120,0.6)",
+    visible=True,
+    showcountries=False,
+    showcoastlines=True,
+    coastlinecolor="rgba(140,140,140,0.7)",
     showland=True,
     landcolor="rgb(245,245,245)",
     showocean=True,
     oceancolor="rgb(230,230,230)",
+    bgcolor="rgba(0,0,0,0)",  # transparente
 )
 
 fig.update_layout(
     height=720,
     margin={"r": 0, "t": 0, "l": 0, "b": 0},
     coloraxis_colorbar=dict(title=map_title),
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(0,0,0,0)",
 )
 
 st.plotly_chart(fig, use_container_width=True)
